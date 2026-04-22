@@ -310,7 +310,7 @@ function ENT:GetPrimaryTarget()
 	for _, ply in ipairs(player.GetAll()) do
 		if not IsValid(ply) or not ply:Alive() then continue end
 		local d = ply:GetPos():DistToSqr(self.CenterPos)
-		if d < closestDist then closestDist = d closest = ply end
+		if d < closestDist then closestDist = d; closest = ply end
 	end
 	return closest
 end
