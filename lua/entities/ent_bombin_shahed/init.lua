@@ -3,7 +3,7 @@ AddCSLuaFile("shared.lua")
 include("shared.lua")
 
 -- ============================================================
--- ENGINE SOUND  (TB2 pattern — anchored to world, not entity)
+-- ENGINE SOUND  (AN-71 method — entity-anchored, 3D positional)
 -- ============================================================
 
 local ENGINE_LOOP_SOUND = "lfs/spitfire/rpm_2.wav"
@@ -116,12 +116,12 @@ function ENT:Initialize()
 		self.PhysObj:EnableGravity(false)
 	end
 
-	-- TB2 pattern: world-anchored, no falloff, no PASS_SOUNDS
-	self.EngineLoop = CreateSound(game.GetWorld(), ENGINE_LOOP_SOUND)
+	-- AN-71 method: entity-anchored, full 3D positional falloff
+	self.EngineLoop = CreateSound(self, ENGINE_LOOP_SOUND)
 	if self.EngineLoop then
-		self.EngineLoop:SetSoundLevel(0)
+		self.EngineLoop:SetSoundLevel(75)
 		self.EngineLoop:ChangePitch(85, 0)
-		self.EngineLoop:ChangeVolume(0.4, 0)
+		self.EngineLoop:ChangeVolume(1.0, 0)
 		self.EngineLoop:Play()
 	end
 
@@ -537,14 +537,9 @@ function ENT:FindGround(centerPos)
 end
 
 -- ============================================================
--- CLEANUP  (TB2 pattern — fade volume then stop)
+-- CLEANUP  (AN-71 method — direct stop, no timer needed)
 -- ============================================================
 
 function ENT:OnRemove()
-	if self.EngineLoop then
-		self.EngineLoop:ChangeVolume(0, 0.5)
-		timer.Simple(0.6, function()
-			if self.EngineLoop then self.EngineLoop:Stop() end
-		end)
-	end
+	if self.EngineLoop then self.EngineLoop:Stop() end
 end
