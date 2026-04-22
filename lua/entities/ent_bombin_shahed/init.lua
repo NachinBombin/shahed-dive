@@ -3,17 +3,10 @@ AddCSLuaFile("shared.lua")
 include("shared.lua")
 
 -- ============================================================
--- PASS SOUNDS & ENGINE
+-- ENGINE SOUND  (TB2 pattern — anchored to world, not entity)
 -- ============================================================
 
-local PASS_SOUNDS = {
-	"lvs_darklord/rotors/rotor_loop_close.wav",
-	"lvs_darklord/rotors/rotor_loop_dist.wav",
-}
-
-local ENGINE_START_SOUND = "lvs_darklord/mi_engine/mi24_engine_start_exterior.wav"
-local ENGINE_LOOP_SOUND  = "^lvs_darklord/rotors/rotor_loop_close.wav"
-local ENGINE_DIST_SOUND  = "^lvs_darklord/rotors/rotor_loop_dist.wav"
+local ENGINE_LOOP_SOUND = "lfs/spitfire/rpm_2.wav"
 
 -- ============================================================
 -- TUNING
@@ -47,27 +40,22 @@ function ENT:Initialize()
 	local ground = self:FindGround(self.CenterPos)
 	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-	-- FIX 7: altitude base variance ±25% of SkyHeightAdd
 	local altVariance = self.SkyHeightAdd * 0.25
 	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVariance, altVariance)
 
 	self.DieTime   = CurTime() + self.Lifetime
 	self.SpawnTime = CurTime()
 
-	-- FIX 4: per-instance radius + speed variance ±18%
 	local baseRadius = self:GetVar("OrbitRadius", 2500)
 	local baseSpeed  = self:GetVar("Speed",        250)
 	self.OrbitRadius = baseRadius * math.Rand(0.82, 1.18)
 	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
 
-	-- FIX 2: random orbit direction — 1 = CCW, -1 = CW
 	self.OrbitDir = (math.random(0, 1) == 0) and 1 or -1
 
-	-- FIX 3: true angular orbit — start at a random angle on the circle
 	self.OrbitAngle    = math.Rand(0, math.pi * 2)
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 
-	-- FIX 1: random spawn bearing — place the craft on the orbit circle edge
 	local entryRad    = self.OrbitAngle
 	local entryOffset = Vector(math.cos(entryRad), math.sin(entryRad), 0)
 	local spawnPos    = self.CenterPos + entryOffset * (self.OrbitRadius * 1.05)
@@ -93,18 +81,15 @@ function ENT:Initialize()
 	self:SetNWInt("HP",    self.MaxHP)
 	self:SetNWInt("MaxHP", self.MaxHP)
 
-	-- FIX 1: face tangent to the orbit circle at the entry angle
 	local tangent = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
 	local startAng = tangent:Angle()
 	self:SetAngles(Angle(0, startAng.y, 0))
 	self.ang = self:GetAngles()
 
-	-- Roll & Pitch state
 	self.SmoothedRoll  = 0
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self:GetAngles().y
 
-	-- FIX 5: dual-frequency altitude jitter
 	self.JitterPhase  = math.Rand(0, math.pi * 2)
 	self.JitterPhase2 = math.Rand(0, math.pi * 2)
 	self.JitterAmp1   = math.Rand(8,  18)
@@ -112,14 +97,12 @@ function ENT:Initialize()
 	self.JitterRate1  = math.Rand(0.030, 0.060)
 	self.JitterRate2  = math.Rand(0.007, 0.015)
 
-	-- Altitude drift (slow macro drift target)
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 	self.AltDriftRange    = 700
 	self.AltDriftLerp     = 0.003
 
-	-- FIX 6: XY wander — orbit center drifts slowly
 	self.BaseCenterPos = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
 	self.WanderPhaseX  = math.Rand(0, math.pi * 2)
 	self.WanderPhaseY  = math.Rand(0, math.pi * 2)
@@ -133,25 +116,14 @@ function ENT:Initialize()
 		self.PhysObj:EnableGravity(false)
 	end
 
-	sound.Play(ENGINE_START_SOUND, spawnPos, 90, 100, 1.0)
-
-	self.RotorLoopClose = CreateSound(self, ENGINE_LOOP_SOUND)
-	if self.RotorLoopClose then
-		self.RotorLoopClose:SetSoundLevel(125)
-		self.RotorLoopClose:ChangePitch(100, 0)
-		self.RotorLoopClose:ChangeVolume(1.0, 0.5)
-		self.RotorLoopClose:Play()
+	-- TB2 pattern: world-anchored, no falloff, no PASS_SOUNDS
+	self.EngineLoop = CreateSound(game.GetWorld(), ENGINE_LOOP_SOUND)
+	if self.EngineLoop then
+		self.EngineLoop:SetSoundLevel(0)
+		self.EngineLoop:ChangePitch(85, 0)
+		self.EngineLoop:ChangeVolume(0.4, 0)
+		self.EngineLoop:Play()
 	end
-
-	self.RotorLoopDist = CreateSound(self, ENGINE_DIST_SOUND)
-	if self.RotorLoopDist then
-		self.RotorLoopDist:SetSoundLevel(125)
-		self.RotorLoopDist:ChangePitch(100, 0)
-		self.RotorLoopDist:ChangeVolume(1.0, 0.5)
-		self.RotorLoopDist:Play()
-	end
-
-	self.NextPassSound = CurTime() + math.Rand(5, 10)
 
 	-- Weapon state
 	self.CurrentWeapon   = nil
@@ -165,22 +137,18 @@ function ENT:Initialize()
 	self.DiveExploded  = false
 	self.DiveAimOffset = Vector(0,0,0)
 
-	-- Layer 1H: Horizontal wobble
 	self.DiveWobblePhase = 0
 	self.DiveWobbleAmp   = 180
 	self.DiveWobbleSpeed = 4.5
 
-	-- Layer 1V: Vertical wobble
 	self.DiveWobblePhaseV = math.Rand(0, math.pi * 2)
 	self.DiveWobbleAmpV   = 130
 	self.DiveWobbleSpeedV = 3.1
 
-	-- Layer 2: Speed surge
 	self.DiveSpeedMin     = self.DIVE_Speed * 0.55
 	self.DiveSpeedCurrent = self.DIVE_Speed * 0.55
 	self.DiveSpeedLerp    = 0.018
 
-	-- Layer 3: Pre-dive pitch telegraph
 	self.DivePitchTelegraph = 0
 
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
@@ -233,14 +201,6 @@ function ENT:Think()
 		self.PhysObj:Wake()
 	end
 
-	if ct >= self.NextPassSound then
-		sound.Play(
-			table.Random(PASS_SOUNDS),
-			self:GetPos(), 100, math.random(96, 104), 1.0
-		)
-		self.NextPassSound = ct + math.Rand(6, 12)
-	end
-
 	local age  = ct - self.SpawnTime
 	local left = self.DieTime - ct
 	local alpha = 255
@@ -274,7 +234,6 @@ function ENT:PhysicsUpdate(phys)
 	local dt  = FrameTime()
 	if dt <= 0 then dt = 0.01 end
 
-	-- FIX 6: advance XY wander — drift the orbit center slowly
 	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
 	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
 	self.CenterPos = Vector(
@@ -283,29 +242,22 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- Keep OrbitAngSpeed in sync if Speed drifted (it doesn't, but future-proof)
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
-
-	-- FIX 3: advance the orbit angle analytically
 	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
-	-- Desired XY position on the circle
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
 	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
 
-	-- Desired heading = tangent at that angle, signed by OrbitDir
 	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
 	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
 	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
 	self.ang = self.ang + Angle(0, yawCorrection, 0)
 
-	-- FIX 5: dual-frequency altitude jitter
 	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
 	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
 	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
 	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
-	-- Macro altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
@@ -314,17 +266,14 @@ function ENT:PhysicsUpdate(phys)
 
 	local liveAlt = self.AltDriftCurrent + jitter
 
-	-- Position: steer toward desired XY on the circle
 	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
 	local vel    = self:GetForward() * self.Speed
 	if posErr:LengthSqr() > 400 then
 		vel = vel + posErr:GetNormalized() * 80
 	end
 
-	-- Apply Z from our jitter system
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
-	-- ROLL — driven by yaw correction magnitude
 	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
 	self.PrevYaw      = self.ang.y
 
@@ -332,7 +281,6 @@ function ENT:PhysicsUpdate(phys)
 	local rollLerp    = rawYawDelta ~= 0 and 0.15 or 0.05
 	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-	-- PITCH — forward-speed driven
 	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
 	local forwardSpeed = physVel:Dot(self:GetForward())
 	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
@@ -589,10 +537,14 @@ function ENT:FindGround(centerPos)
 end
 
 -- ============================================================
--- CLEANUP
+-- CLEANUP  (TB2 pattern — fade volume then stop)
 -- ============================================================
 
 function ENT:OnRemove()
-	if self.RotorLoopClose then self.RotorLoopClose:Stop() end
-	if self.RotorLoopDist  then self.RotorLoopDist:Stop()  end
+	if self.EngineLoop then
+		self.EngineLoop:ChangeVolume(0, 0.5)
+		timer.Simple(0.6, function()
+			if self.EngineLoop then self.EngineLoop:Stop() end
+		end)
+	end
 end
