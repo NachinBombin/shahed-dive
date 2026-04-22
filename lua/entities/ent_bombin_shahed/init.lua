@@ -33,8 +33,6 @@ function ENT:Initialize()
 	self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
 	self.CallDir      = self:GetVar("CallDir",      Vector(1,0,0))
 	self.Lifetime     = self:GetVar("Lifetime",     40)
-	self.Speed        = self:GetVar("Speed",        250)
-	self.OrbitRadius  = self:GetVar("OrbitRadius",  2500)
 	self.SkyHeightAdd = self:GetVar("SkyHeightAdd", 2500)
 
 	self.DIVE_ExplosionDamage = self:GetVar("DIVE_ExplosionDamage", 700)
@@ -49,12 +47,32 @@ function ENT:Initialize()
 	local ground = self:FindGround(self.CenterPos)
 	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-	self.sky       = ground + self.SkyHeightAdd
+	-- FIX 7: altitude base variance ±25% of SkyHeightAdd
+	local altVariance = self.SkyHeightAdd * 0.25
+	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVariance, altVariance)
+
 	self.DieTime   = CurTime() + self.Lifetime
 	self.SpawnTime = CurTime()
 
-	local spawnPos = self.CenterPos - self.CallDir * 2000
-	spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
+	-- FIX 4: per-instance radius + speed variance ±18%
+	local baseRadius = self:GetVar("OrbitRadius", 2500)
+	local baseSpeed  = self:GetVar("Speed",        250)
+	self.OrbitRadius = baseRadius * math.Rand(0.82, 1.18)
+	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
+
+	-- FIX 2: random orbit direction — 1 = CCW, -1 = CW
+	self.OrbitDir = (math.random(0, 1) == 0) and 1 or -1
+
+	-- FIX 3: true angular orbit — start at a random angle on the circle
+	self.OrbitAngle    = math.Rand(0, math.pi * 2)
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+
+	-- FIX 1: random spawn bearing — place the craft on the orbit circle edge
+	local entryRad    = self.OrbitAngle
+	local entryOffset = Vector(math.cos(entryRad), math.sin(entryRad), 0)
+	local spawnPos    = self.CenterPos + entryOffset * (self.OrbitRadius * 1.05)
+	spawnPos.z        = self.sky
+
 	if not util.IsInWorld(spawnPos) then
 		spawnPos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
 	end
@@ -75,8 +93,10 @@ function ENT:Initialize()
 	self:SetNWInt("HP",    self.MaxHP)
 	self:SetNWInt("MaxHP", self.MaxHP)
 
-	local ang = self.CallDir:Angle()
-	self:SetAngles(Angle(0, ang.y + 70, 0))
+	-- FIX 1: face tangent to the orbit circle at the entry angle
+	local tangent = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
+	local startAng = tangent:Angle()
+	self:SetAngles(Angle(0, startAng.y, 0))
 	self.ang = self:GetAngles()
 
 	-- Roll & Pitch state
@@ -84,16 +104,28 @@ function ENT:Initialize()
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self:GetAngles().y
 
-	-- Wind jitter
-	self.JitterPhase     = math.Rand(0, math.pi * 2)
-	self.JitterAmplitude = 12
+	-- FIX 5: dual-frequency altitude jitter
+	self.JitterPhase  = math.Rand(0, math.pi * 2)
+	self.JitterPhase2 = math.Rand(0, math.pi * 2)
+	self.JitterAmp1   = math.Rand(8,  18)
+	self.JitterAmp2   = math.Rand(20, 45)
+	self.JitterRate1  = math.Rand(0.030, 0.060)
+	self.JitterRate2  = math.Rand(0.007, 0.015)
 
-	-- Altitude drift
+	-- Altitude drift (slow macro drift target)
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 	self.AltDriftRange    = 700
 	self.AltDriftLerp     = 0.003
+
+	-- FIX 6: XY wander — orbit center drifts slowly
+	self.BaseCenterPos = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
+	self.WanderPhaseX  = math.Rand(0, math.pi * 2)
+	self.WanderPhaseY  = math.Rand(0, math.pi * 2)
+	self.WanderAmp     = math.Rand(60, 160)
+	self.WanderRateX   = math.Rand(0.004, 0.010)
+	self.WanderRateY   = math.Rand(0.003, 0.009)
 
 	self.PhysObj = self:GetPhysicsObject()
 	if IsValid(self.PhysObj) then
@@ -151,7 +183,7 @@ function ENT:Initialize()
 	-- Layer 3: Pre-dive pitch telegraph
 	self.DivePitchTelegraph = 0
 
-	self:Debug("Spawned at " .. tostring(spawnPos))
+	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
 -- ============================================================
@@ -235,69 +267,84 @@ end
 
 function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
-
 	if self.Diving then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
 	local pos = self:GetPos()
+	local dt  = FrameTime()
+	if dt <= 0 then dt = 0.01 end
 
-	-- Altitude drift
+	-- FIX 6: advance XY wander — drift the orbit center slowly
+	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
+	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
+	self.CenterPos = Vector(
+		self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp,
+		self.BaseCenterPos.y + math.sin(self.WanderPhaseY) * self.WanderAmp,
+		self.BaseCenterPos.z
+	)
+
+	-- Keep OrbitAngSpeed in sync if Speed drifted (it doesn't, but future-proof)
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+
+	-- FIX 3: advance the orbit angle analytically
+	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
+
+	-- Desired XY position on the circle
+	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
+	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
+
+	-- Desired heading = tangent at that angle, signed by OrbitDir
+	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
+	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
+	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
+	self.ang = self.ang + Angle(0, yawCorrection, 0)
+
+	-- FIX 5: dual-frequency altitude jitter
+	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
+	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
+	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
+	             + math.sin(self.JitterPhase2) * self.JitterAmp2
+
+	-- Macro altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-	-- Wind jitter
-	self.JitterPhase = self.JitterPhase + 0.04
-	local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
-
 	local liveAlt = self.AltDriftCurrent + jitter
+
+	-- Position: steer toward desired XY on the circle
+	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
+	local vel    = self:GetForward() * self.Speed
+	if posErr:LengthSqr() > 400 then
+		vel = vel + posErr:GetNormalized() * 80
+	end
+
+	-- Apply Z from our jitter system
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
-	-- Orbit turn
-	local flatPos    = Vector(pos.x, pos.y, 0)
-	local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
-	local dist       = flatPos:Distance(flatCenter)
+	-- ROLL — driven by yaw correction magnitude
+	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
+	self.PrevYaw      = self.ang.y
 
-	local orbitYaw = 0
-	if dist > self.OrbitRadius and (self.TurnDelay or 0) < CurTime() then
-		orbitYaw       = 0.1
-		self.TurnDelay = CurTime() + 0.02
-	end
-
-	local trSkyCheck = util.QuickTrace(self:GetPos(), self:GetForward() * 3000, self)
-	local skyYaw = 0
-	if trSkyCheck.HitSky then
-		skyYaw = 0.3
-	end
-
-	local totalYawDelta = orbitYaw + skyYaw
-	self.ang = self.ang + Angle(0, totalYawDelta, 0)
-
-	-- ROLL — yaw-rate driven
-	local currentYaw  = self.ang.y
-	local rawYawDelta = math.NormalizeAngle(currentYaw - (self.PrevYaw or currentYaw))
-	self.PrevYaw      = currentYaw
-
-	local targetRoll  = math.Clamp(rawYawDelta * -25, -25, 25)
+	local targetRoll  = math.Clamp(rawYawDelta * -25, -30, 30)
 	local rollLerp    = rawYawDelta ~= 0 and 0.15 or 0.05
 	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
 	-- PITCH — forward-speed driven
-	local vel          = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
-	local forwardSpeed = vel:Dot(self:GetForward())
+	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
+	local forwardSpeed = physVel:Dot(self:GetForward())
 	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
 	local targetPitch  = math.Clamp(speedRatio * 10, -15, 15)
 	self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
 	self.ang.p = self.SmoothedPitch
 	self.ang.r = self.SmoothedRoll
-
 	self:SetAngles(self.ang)
 
 	if IsValid(phys) then
-		phys:SetVelocity(self:GetForward() * self.Speed)
+		phys:SetVelocity(vel)
 	end
 
 	if not self:IsInWorld() then
@@ -361,7 +408,6 @@ function ENT:InitDive(ct)
 		return
 	end
 
-	-- Pitch nose down progressively during the 1s commit window
 	local commitFraction    = math.Clamp((ct - (self.DiveCommitTime - 1.0)) / 1.0, 0, 1)
 	self.DivePitchTelegraph = commitFraction * -60
 	self:SetAngles(Angle(self.DivePitchTelegraph, self.ang.y, self.SmoothedRoll))
@@ -384,12 +430,10 @@ function ENT:InitDive(ct)
 	self.DiveCommitTime     = nil
 	self.DivePitchTelegraph = 0
 
-	-- Reset wobble phases
 	self.DiveWobblePhase  = 0
 	self.DiveWobblePhaseV = math.Rand(0, math.pi * 2)
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 
-	-- Fixed aim error baked at launch
 	self.DiveAimOffset = Vector(
 		math.Rand(-400, 400),
 		math.Rand(-400, 400),
@@ -409,7 +453,6 @@ end
 function ENT:UpdateDive(ct)
 	if self.DiveExploded then return end
 
-	-- Refresh target position periodically with sensor noise
 	if ct >= self.DiveNextTrack then
 		if IsValid(self.DiveTarget) and self.DiveTarget:Alive() then
 			local trackJitter = Vector(
@@ -437,25 +480,21 @@ function ENT:UpdateDive(ct)
 
 	dir:Normalize()
 
-	-- Speed surge
 	self.DiveSpeedCurrent = Lerp(self.DiveSpeedLerp, self.DiveSpeedCurrent, self.DIVE_Speed)
 
 	local dt = FrameTime()
 
-	-- Horizontal wobble
 	self.DiveWobblePhase = self.DiveWobblePhase + self.DiveWobbleSpeed * dt
 	local flatRight = Vector(-dir.y, dir.x, 0)
 	if flatRight:LengthSqr() < 0.01 then flatRight = Vector(1, 0, 0) end
 	flatRight:Normalize()
 
-	-- Vertical wobble (Gram-Schmidt)
 	self.DiveWobblePhaseV = self.DiveWobblePhaseV + self.DiveWobbleSpeedV * dt
 	local worldUp = Vector(0, 0, 1)
 	local upPerp  = worldUp - dir * dir:Dot(worldUp)
 	if upPerp:LengthSqr() < 0.01 then upPerp = Vector(0, 1, 0) end
 	upPerp:Normalize()
 
-	-- Wobble tapers to zero inside 400 units
 	local wobbleScale = math.Clamp(dist / 400, 0, 1)
 
 	local wobbleVel =
@@ -464,7 +503,6 @@ function ENT:UpdateDive(ct)
 
 	local totalVel = dir * self.DiveSpeedCurrent + wobbleVel
 
-	-- Face actual direction of travel
 	if totalVel:LengthSqr() > 0.01 then
 		local travelDir = totalVel:GetNormalized()
 		local faceAng   = travelDir:Angle()
@@ -473,7 +511,6 @@ function ENT:UpdateDive(ct)
 		self.ang = faceAng
 	end
 
-	-- Collision check
 	local nextPos = myPos + totalVel * dt
 	local tr = util.TraceLine({
 		start  = myPos,
@@ -498,7 +535,6 @@ function ENT:DiveExplode(pos)
 
 	self:Debug("DIVE: exploding at " .. tostring(pos))
 
-	-- Three stacked blast effects — larger than TB-2
 	local ed1 = EffectData()
 	ed1:SetOrigin(pos)
 	ed1:SetScale(8) ed1:SetMagnitude(8) ed1:SetRadius(800)
@@ -514,7 +550,6 @@ function ENT:DiveExplode(pos)
 	ed3:SetScale(5) ed3:SetMagnitude(5) ed3:SetRadius(600)
 	util.Effect("500lb_air", ed3, true, true)
 
-	-- Extra ground-level ring
 	local ed4 = EffectData()
 	ed4:SetOrigin(pos + Vector(0,0,-20))
 	ed4:SetScale(4) ed4:SetMagnitude(4) ed4:SetRadius(500)
