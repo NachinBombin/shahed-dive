@@ -21,6 +21,35 @@ ENT.FadeDuration  = 2.0
 ENT.DIVE_Speed         = 1800
 ENT.DIVE_TrackInterval = 0.1
 
+util.AddNetworkString("bombin_shahed_damage_tier")
+
+-- ============================================================
+-- TIER HELPERS
+-- ============================================================
+
+local function CalcTier(hp, maxHP)
+	local frac = hp / maxHP
+	if frac > 0.66 then return 0 end
+	if frac > 0.33 then return 1 end
+	if hp   > 0    then return 2 end
+	return 3
+end
+
+local function BroadcastTier(ent, tier)
+	net.Start("bombin_shahed_damage_tier")
+		net.WriteUInt(ent:EntIndex(), 16)
+		net.WriteUInt(tier, 2)
+	net.Broadcast()
+end
+
+-- ============================================================
+-- DEBUG
+-- ============================================================
+
+function ENT:Debug(msg)
+	print("[Bombin Shahed] " .. tostring(msg))
+end
+
 -- ============================================================
 -- INITIALIZE
 -- ============================================================
@@ -159,6 +188,9 @@ function ENT:Initialize()
 	self.ExplodeTimer    = nil
 	self.ExplodedAlready = false
 
+	-- Damage tier (0=healthy, 1=light, 2=heavy, 3=dead)
+	self.DamageTier = 0
+
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
@@ -215,6 +247,8 @@ function ENT:SetDestroyed()
 	self:SetNWBool("Destroyed", true)
 	self.DestroyedTime = CurTime()
 
+	BroadcastTier(self, 3)
+
 	if IsValid(self.PhysObj) then
 		self.TumbleAngVel = self.PhysObj:GetAngleVelocity() + Vector(
 			math.Rand(-120, 120),
@@ -256,18 +290,16 @@ function ENT:OnTakeDamage(dmginfo)
 	hp = hp - dmginfo:GetDamage()
 	self:SetNWInt("HP", hp)
 
+	local newTier = CalcTier(math.max(hp, 0), self.MaxHP)
+	if newTier ~= self.DamageTier then
+		self.DamageTier = newTier
+		BroadcastTier(self, newTier)
+	end
+
 	if hp <= 0 and not self:IsDestroyed() then
 		self:Debug("Shot down!")
 		self:SetDestroyed()
 	end
-end
-
--- ============================================================
--- DEBUG
--- ============================================================
-
-function ENT:Debug(msg)
-	print("[Bombin Shahed] " .. tostring(msg))
 end
 
 -- ============================================================
