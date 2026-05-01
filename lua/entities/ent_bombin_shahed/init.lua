@@ -6,9 +6,9 @@ include("shared.lua")
 -- ENGINE SOUND  (AN-71 method — entity-anchored, 3D positional)
 -- ============================================================
 
-local ENGINE_LOOP_SOUND = "lfs/spitfire/rpm_2.wav"
+local ENGINE_LOOP_SOUND = "shahed/eng_loop.wav"
 local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
-local GRAVITY_MULT      = 1.5
+local GRAVITY_MULT      = 1.1
 local SHARD_LIFE        = 8
 
 -- ============================================================
