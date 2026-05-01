@@ -191,6 +191,23 @@ function ENT:Initialize()
 	-- Damage tier (0=healthy, 1=light, 2=heavy, 3=dead)
 	self.DamageTier = 0
 
+	-- ----------------------------------------------------------------
+	-- EVASION STATE
+	-- Shared yaw bias accumulator used by BOTH sky and geometry probes.
+	-- The sky system pushes this when HitSky fires;
+	-- the obstacle system pushes this when HitWorld / brush fires.
+	-- Both decay through separate per-tick multipliers so each system
+	-- stays tuned independently while cooperating on OrbitAngSpeed.
+	-- ----------------------------------------------------------------
+	self.SkyYawBias      = 0
+	self.SkyProbeDist    = math.max(1200, self.Speed * 6)
+	self.SkyProbeLastHit = 0
+
+	self.ObsLastEval   = 0
+	self.ObsYawBias    = 0
+	self.ObsAltBias    = 0
+	self.ObsConsecHits = 0
+
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
@@ -355,6 +372,149 @@ function ENT:Think()
 end
 
 -- ============================================================
+-- EVASION PROBES
+-- ============================================================
+--
+-- Two subsystems share the same per-tick update path:
+--
+--   1. EvaluateSkyProbes   — QuickTrace / HitSky only.
+--      Handles skybox ceiling and sky-walls to the sides.
+--
+--   2. EvaluateObstacleProbes — TraceLine / MASK_SOLID_BRUSHONLY.
+--      Handles buildings, displacement terrain, indoor ceilings,
+--      large static props.
+--
+-- Both return (yawBiasDelta, altPush) and are merged into
+-- separate accumulators (SkyYawBias, ObsYawBias, ObsAltBias)
+-- before being summed into OrbitAngSpeed each tick.
+-- ============================================================
+
+-- ---------- SKY constants ----------
+local SKY_PROBE_DIST_H   = 1400
+local SKY_PROBE_DIST_V   = 900
+local SKY_YAW_BIAS_RATE  = 0.35
+local SKY_YAW_BIAS_DECAY = 0.88
+local SKY_ALT_PUSH       = 180
+local SKY_ALT_RISE       = 120
+
+-- ---------- OBSTACLE constants ----------
+local OBS_DIST_FWD     = 900
+local OBS_DIST_SIDE    = 700
+local OBS_DIST_UP      = 500
+local OBS_DIST_DOWN    = 300
+local OBS_YAW_RATE     = 0.55
+local OBS_ALT_PUSH_UP  = 250
+local OBS_ALT_PUSH_DN  = 80
+local OBS_YAW_DECAY    = 0.82
+local OBS_ALT_DECAY    = 0.90
+local OBS_EVAL_RATE    = 0.05   -- run probes at 20 Hz
+local OBS_NEAR_FRAC    = 0.45   -- hits within 45% of probe dist -> double push
+local OBS_ESCALATE_MAX = 4      -- consecutive hits before orbit-direction flip
+
+local OBS_TRACE_MASK = MASK_SOLID_BRUSHONLY
+
+function ENT:EvaluateSkyProbes(pos, flatFwd)
+	local flatRight = Vector(-flatFwd.y, flatFwd.x, 0)
+
+	local probes = {
+		{ dir = flatFwd,                                             dist = SKY_PROBE_DIST_H, role = "fwd"   },
+		{ dir = (flatFwd + flatRight * 0.7):GetNormalized(),         dist = SKY_PROBE_DIST_H, role = "right" },
+		{ dir = (flatFwd - flatRight * 0.7):GetNormalized(),         dist = SKY_PROBE_DIST_H, role = "left"  },
+		{ dir = Vector(flatFwd.x, flatFwd.y,  1):GetNormalized(),    dist = SKY_PROBE_DIST_V, role = "up"    },
+		{ dir = Vector(flatFwd.x, flatFwd.y, -0.5):GetNormalized(),  dist = SKY_PROBE_DIST_V, role = "down"  },
+	}
+
+	local yawBias = 0
+	local altPush = 0
+	local anySky  = false
+
+	for _, p in ipairs(probes) do
+		local tr = util.QuickTrace(pos, p.dir * p.dist, self)
+		if not tr.HitSky then continue end
+		anySky = true
+
+		if p.role == "fwd" then
+			yawBias = yawBias + SKY_YAW_BIAS_RATE * 2.0 * self.OrbitDir
+		elseif p.role == "right" then
+			yawBias = yawBias - SKY_YAW_BIAS_RATE
+		elseif p.role == "left" then
+			yawBias = yawBias + SKY_YAW_BIAS_RATE
+		elseif p.role == "up" then
+			altPush = altPush - SKY_ALT_PUSH
+		elseif p.role == "down" then
+			altPush = altPush + SKY_ALT_RISE
+		end
+	end
+
+	if anySky then self.SkyProbeLastHit = CurTime() end
+	return yawBias, altPush
+end
+
+function ENT:EvaluateObstacleProbes(pos, flatFwd)
+	local flatRight = Vector(-flatFwd.y, flatFwd.x, 0)
+
+	local probes = {
+		{ dir = flatFwd,                                              dist = OBS_DIST_FWD,        role = "fwd"      },
+		{ dir = flatFwd,                                              dist = OBS_DIST_FWD * 0.4,  role = "fwd_near" },
+		{ dir = (flatFwd + flatRight * 0.65):GetNormalized(),         dist = OBS_DIST_SIDE,       role = "right"    },
+		{ dir = (flatFwd - flatRight * 0.65):GetNormalized(),         dist = OBS_DIST_SIDE,       role = "left"     },
+		{ dir = Vector(flatFwd.x, flatFwd.y, 0.5):GetNormalized(),   dist = OBS_DIST_UP,         role = "up_fwd"   },
+		{ dir = Vector(flatFwd.x, flatFwd.y, -0.4):GetNormalized(),  dist = OBS_DIST_DOWN,       role = "down_fwd" },
+	}
+
+	local yawBias = 0
+	local altPush = 0
+	local anyHit  = false
+
+	for _, p in ipairs(probes) do
+		local tr = util.TraceLine({
+			start  = pos,
+			endpos = pos + p.dir * p.dist,
+			filter = self,
+			mask   = OBS_TRACE_MASK,
+		})
+
+		if not tr.Hit or tr.HitSky then continue end
+
+		anyHit = true
+		local urgency = (tr.Fraction < OBS_NEAR_FRAC) and 2.0 or 1.0
+
+		if p.role == "fwd" or p.role == "fwd_near" then
+			local scale = (p.role == "fwd_near") and 1.5 or 1.0
+			yawBias = yawBias + OBS_YAW_RATE * urgency * scale * self.OrbitDir
+			altPush = altPush + OBS_ALT_PUSH_UP * urgency * scale
+
+		elseif p.role == "right" then
+			yawBias = yawBias - OBS_YAW_RATE * urgency
+
+		elseif p.role == "left" then
+			yawBias = yawBias + OBS_YAW_RATE * urgency
+
+		elseif p.role == "up_fwd" then
+			altPush = altPush - OBS_ALT_PUSH_DN * urgency
+			yawBias = yawBias + OBS_YAW_RATE * 0.5 * urgency * self.OrbitDir
+
+		elseif p.role == "down_fwd" then
+			altPush = altPush + OBS_ALT_PUSH_UP * 0.6 * urgency
+		end
+	end
+
+	if anyHit then
+		self.ObsConsecHits = (self.ObsConsecHits or 0) + 1
+		if self.ObsConsecHits >= OBS_ESCALATE_MAX then
+			self.OrbitDir      = -self.OrbitDir
+			yawBias            = yawBias + OBS_YAW_RATE * 4.0 * self.OrbitDir
+			self.ObsConsecHits = 0
+			self:Debug("Obstacle escalation — orbit reversed")
+		end
+	else
+		self.ObsConsecHits = math.max(0, (self.ObsConsecHits or 0) - 1)
+	end
+
+	return yawBias, altPush
+end
+
+-- ============================================================
 -- FLIGHT
 -- ============================================================
 
@@ -392,6 +552,7 @@ function ENT:PhysicsUpdate(phys)
 	local dt  = FrameTime()
 	if dt <= 0 then dt = 0.01 end
 
+	-- Wander center drift
 	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
 	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
 	self.CenterPos = Vector(
@@ -400,7 +561,48 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
+	-- ----------------------------------------------------------------
+	-- EVASION EVALUATION (rate-limited to 20 Hz)
+	-- ----------------------------------------------------------------
+	local flatFwd = Angle(0, self.ang.y, 0):Forward()
+	flatFwd.z = 0
+	if flatFwd:LengthSqr() < 0.01 then flatFwd = Vector(1, 0, 0) end
+	flatFwd:Normalize()
+
+	local ct = CurTime()
+	if ct - self.ObsLastEval >= OBS_EVAL_RATE then
+		self.ObsLastEval = ct
+
+		local skyYaw, skyAlt = self:EvaluateSkyProbes(pos, flatFwd)
+		local obsYaw, obsAlt = self:EvaluateObstacleProbes(pos, flatFwd)
+
+		self.SkyYawBias = self.SkyYawBias + skyYaw
+		self.ObsYawBias = self.ObsYawBias + obsYaw
+		self.ObsAltBias = self.ObsAltBias + obsAlt
+
+		local totalAlt = skyAlt + obsAlt
+		if totalAlt ~= 0 then
+			self.AltDriftTarget = math.Clamp(
+				self.AltDriftTarget + totalAlt,
+				self.sky - self.AltDriftRange * 2,
+				self.sky + self.AltDriftRange * 0.5
+			)
+			self.AltDriftCurrent = Lerp(self.AltDriftLerp * 10, self.AltDriftCurrent, self.AltDriftTarget)
+		end
+	end
+
+	-- Per-tick decay
+	self.SkyYawBias = self.SkyYawBias * SKY_YAW_BIAS_DECAY
+	self.ObsYawBias = self.ObsYawBias * OBS_YAW_DECAY
+	self.ObsAltBias = self.ObsAltBias * OBS_ALT_DECAY
+
+	self.SkyYawBias = math.Clamp(self.SkyYawBias, -1.8, 1.8)
+	self.ObsYawBias = math.Clamp(self.ObsYawBias, -2.5, 2.5)
+
+	-- ---- Orbit integration with merged bias ----
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	                   + self.SkyYawBias
+	                   + self.ObsYawBias
 	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
@@ -411,18 +613,21 @@ function ENT:PhysicsUpdate(phys)
 	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
 	self.ang = self.ang + Angle(0, yawCorrection, 0)
 
+	-- Jitter
 	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
 	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
 	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
 	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
-	if CurTime() >= self.AltDriftNextPick then
+	-- Altitude drift
+	if ct >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
-		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
+		self.AltDriftNextPick = ct + math.Rand(10, 25)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 	local liveAlt = self.AltDriftCurrent + jitter
 
+	-- Position correction toward orbit ring
 	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
 	local vel    = self:GetForward() * self.Speed
 	if posErr:LengthSqr() > 400 then
@@ -431,6 +636,7 @@ function ENT:PhysicsUpdate(phys)
 
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
+	-- Roll / pitch smoothing
 	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
 	self.PrevYaw      = self.ang.y
 
@@ -452,8 +658,15 @@ function ENT:PhysicsUpdate(phys)
 	end
 
 	if not self:IsInWorld() then
-		self:Debug("Out of world — removing")
-		self:Remove()
+		-- Graceful recovery: re-center instead of removing
+		self:Debug("Out of world — center recovery")
+		local safePos = Vector(self.BaseCenterPos.x, self.BaseCenterPos.y, self.sky)
+		self:SetPos(safePos)
+		if IsValid(phys) then phys:SetVelocity(Vector(0,0,0)) end
+		self.OrbitAngle = math.atan2(
+			safePos.y - self.CenterPos.y,
+			safePos.x - self.CenterPos.x
+		)
 	end
 end
 
