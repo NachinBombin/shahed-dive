@@ -1,4 +1,5 @@
 include("shared.lua")
+include("cl_trailsystem.lua")
 
 -- ================================================================
 -- Shahed (Geran-2) — CLIENT
