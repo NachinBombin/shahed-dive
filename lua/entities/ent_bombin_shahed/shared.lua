@@ -8,4 +8,8 @@ ENT.Category       = "Bombin Support"
 ENT.Spawnable      = false
 ENT.AdminSpawnable = false
 
-ENT.RenderGroup    = RENDERGROUP_OPAQUE
+-- NOTE: RENDERGROUP_OPAQUE removed intentionally.
+-- The JASSM/SCALP pattern does not force opaque render group;
+-- leaving it at the default (RENDERGROUP_BOTH) lets the engine
+-- pick the correct pass and avoids black-model issues with
+-- bodygroup swaps and translucent material slots.

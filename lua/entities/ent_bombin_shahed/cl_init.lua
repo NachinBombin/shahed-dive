@@ -2,9 +2,12 @@ include("shared.lua")
 include("cl_trailsystem.lua")
 
 -- ================================================================
--- Shahed (Geran-2) — CLIENT
+-- Shahed (Geran-2) -- CLIENT
+-- Model handling mirrors the JASSM/SCALP pattern exactly:
+--   ENT:Initialize() applies SetModelScale + SetBodygroup.
+--   ENT:Draw() calls self:DrawModel() so the engine renders it.
 -- Health degradation FX: flames, sparks, smoke via particle system.
--- geran2.mdl is a large delta-wing body — offsets spread across
+-- Geran-2 is a large delta-wing body -- offsets spread across
 -- the wide wing span (~120u) and fuselage centerline.
 -- ================================================================
 
@@ -16,22 +19,18 @@ PrecacheParticleSystem("fire_medium_02")
 
 -- ----------------------------------------------------------------
 -- Damage tier FX config
--- Geran-2 has a wide delta wing — tier 1 fires at wing tips,
+-- Geran-2 has a wide delta wing -- tier 1 fires at wing tips,
 -- tier 2 adds fuselage center and nose attachment.
 -- ----------------------------------------------------------------
 local TIER_OFFSETS = {
 	[1] = {
-		-- port wing tip, starboard wing tip
 		{ x =  70, y =  10, z = 0 },
 		{ x = -70, y =  10, z = 0 },
 	},
 	[2] = {
-		-- wing tips (same as tier 1)
 		{ x =  70, y =  10, z = 0 },
 		{ x = -70, y =  10, z = 0 },
-		-- fuselage center
 		{ x =   0, y =   0, z = 4 },
-		-- nose section
 		{ x =   0, y =  50, z = 4 },
 	},
 }
@@ -66,7 +65,6 @@ end
 local function SpawnBurstFX(ent, tier)
 	if not IsValid(ent) then return end
 	local count = TIER_BURST_COUNT[tier] or 1
-	-- Shahed: scatter bursts across the wide wing span (right axis)
 	local right = ent:GetRight()
 	for i = 1, count do
 		local offset = right * math.Rand(-70, 70)
@@ -132,7 +130,7 @@ hook.Add("Think", "bombin_shahed_damage_fx", function()
 			continue
 		end
 
-		-- Resolve deferred tier
+		-- Resolve deferred tier (entity may not be networked yet at net.Receive time)
 		if state.pendingTier then
 			state.tier = state.pendingTier
 			state.pendingTier = nil
@@ -165,8 +163,17 @@ end)
 
 -- ----------------------------------------------------------------
 -- Standard entity functions
+-- JASSM/SCALP pattern: SetModelScale + SetBodygroup in Initialize.
+-- This is what was missing and caused the addon to not load/render.
+-- timer.Simple(0) defers until after the engine has finished
+-- setting up the entity's model on the client side.
 -- ----------------------------------------------------------------
 function ENT:Initialize()
+	timer.Simple(0, function()
+		if not IsValid(self) then return end
+		self:SetModelScale(1, 0)
+		self:SetBodygroup(1, 1)
+	end)
 end
 
 function ENT:Draw()
